@@ -688,12 +688,52 @@ class TestTransformation:
         r2_reproj = r2.reproject(res=r2.res[0] * 2)
         assert r2_reproj.area_or_point == "Point"
 
+    @pytest.mark.parametrize("apply_vertical", [None, False, True])
+    @pytest.mark.parametrize("raster_type", ["raster", "dataarray"])
+    @pytest.mark.parametrize("res", [None, 2])
+    def test_reproject__vertical_shift(self, apply_vertical: bool | None, raster_type: str, res: int | None) -> None:
+        """Checks reproject properly modifies elevation when apply_vertical is True."""
+
+        # We create a constant DEM with a NaN
+        values = np.full((7, 9), 100, dtype="float32")
+        values[3, 3] = np.nan
+        transform = rio.transform.from_origin(500000, 5000000, 1, 1)
+        source = gu.Raster.from_array(values, transform, 32631, nodata=-9999)
+        image = source if raster_type == "raster" else source.to_xarray().rst
+
+        # We define a 10 m vertical offset in the projection (to not depend on a downloaded geoid grid; xDEM takes
+        # care of this management of vertical referencing in more details)
+        operation = "+proj=pipeline +step +proj=affine +zoff=10"
+        options = {"COORDINATE_OPERATION": operation, "APPLY_VERTICAL_SHIFT": "YES"}
+        saved_options = options.copy()
+        controls: dict[str, Any] = {} if apply_vertical is None else {"apply_vertical": apply_vertical}
+
+        # Reproject on the original grid (also checking user option apply_vertical overrides GDAL option)
+        result = image.reproject(res=res, resampling="nearest", transformer_options=options, silent=True, **controls)
+        result_raster = result if raster_type == "raster" else result.rst
+
+        # Check height offset, NaN value and that source values were not affected
+        result_values = result_raster.to_nanarray()
+        valid = np.isfinite(result_values)
+        assert np.any(valid)
+        assert np.any(~valid)
+        expected_height = 110 if apply_vertical else 100
+        np.testing.assert_array_equal(result_values[valid], np.full(np.count_nonzero(valid), expected_height))
+        assert result_raster.nodata == source.nodata
+        np.testing.assert_array_equal(source.to_nanarray(), values)
+        assert options == saved_options
+
     @pytest.mark.parametrize("loaded", [False, True])
-    def test_reproject__gcp_rcp_match_rasterio(self, raster_gcp_rpc: gu.Raster, loaded: bool) -> None:
+    @pytest.mark.parametrize("tolerance", [None, 0, 0.125])
+    def test_reproject__gcp_rcp_match_rasterio(
+        self, raster_gcp_rpc: gu.Raster, loaded: bool, tolerance: float | None
+    ) -> None:
         """Checks that reprojecting with GCPs/RPCs matches exactly Rasterio."""
 
         # Use the same source loaded/unloaded
         source = raster_gcp_rpc
+        if tolerance and Version(rio.__version__) < Version("1.5.0"):
+            pytest.skip("Setting tolerance requires Rasterio >= 1.5")
         if loaded:
             source.load()
         options = {"RPC_HEIGHT": 80} if source.rpcs else {}
@@ -724,7 +764,7 @@ class TestTransformation:
                 dst_transform=transform,
                 dst_nodata=source.nodata,
                 resampling=rio.enums.Resampling.nearest,
-                tolerance=0,
+                tolerance=0 if tolerance is None else tolerance,
                 XSCALE=1,
                 YSCALE=1,
                 **georeferencing,
@@ -732,7 +772,8 @@ class TestTransformation:
             )
 
         # Check that the affine output clears GCPs/RPCs, and that we have exactly equality
-        result = source.reproject(crs=3857, resampling="nearest", transformer_options=options)
+        controls: dict[str, Any] = {} if tolerance is None else {"tolerance": tolerance}
+        result = source.reproject(crs=3857, resampling="nearest", transformer_options=options, **controls)
         assert source.is_loaded
         assert result.shape == (height, width)
         assert result.transform == transform
@@ -1176,6 +1217,63 @@ class TestTransformationChunked:
         assert isinstance(ds.data, da.Array)
         assert np.allclose(base.to_nanarray(), mp.to_nanarray(), equal_nan=True)
         assert np.allclose(base.to_nanarray(), dask_r.compute().data, equal_nan=True)
+
+    @pytest.mark.parametrize("backend", ["dask", "mp"])
+    @pytest.mark.parametrize("apply_vertical", [False, True])
+    @pytest.mark.parametrize("tolerance", [0, 0.125])
+    def test_reproject__vertical_shift_chunk_invariance(
+        self, tmp_path: Path, backend: str, apply_vertical: bool, tolerance: float
+    ) -> None:
+        """Checks that Dask/MP applies vertical shift or tolerance, matching eager."""
+
+        # We create and write a constant DEM with a NaN, and a transformation with 10 m vertical offset
+        # (We use an affine transform, so approximation gives the same coordinates at either tolerance)
+        values = np.full((7, 9), 100, dtype="float32")
+        values[3, 3] = np.nan
+        transform = rio.transform.from_origin(500000, 5000000, 1, 1)
+        source_file = tmp_path / "elevations.tif"
+        gu.Raster.from_array(values, transform, 32631, nodata=-9999).to_file(source_file)
+        source = gu.Raster(source_file)
+        options = {"COORDINATE_OPERATION": "+proj=pipeline +step +proj=affine +zoff=10"}
+        controls: dict[str, Any] = {"tolerance": tolerance, "apply_vertical": apply_vertical}
+        assert not source.is_loaded
+
+        # Run eager + Dask/MP reprojection, check laziness and loading
+        eager_source = gu.Raster(source_file)
+        expected = eager_source.reproject(res=2, resampling="nearest", transformer_options=options, **controls)
+        assert eager_source.is_loaded
+        assert expected.is_loaded
+        if backend == "dask":
+            import_optional("dask")
+            lazy = gu.open_raster(str(source_file), chunks={"y": 3, "x": 4})
+            result = lazy.rst.reproject(res=2, resampling="nearest", transformer_options=options, **controls)
+            assert not lazy.rst.is_loaded
+            assert not result.rst.is_loaded
+            assert lazy.rst._chunks is not None
+            assert result.rst._chunks is not None
+            result_values = result.compute().values
+            assert not lazy.rst.is_loaded
+            result_raster = result.rst
+        else:
+            with MpCluster({"nb_workers": 2}) as cluster:
+                config = MultiprocConfig(cluster=cluster, chunks=(3, 4), outfile=str(tmp_path / "shifted.tif"))
+                result = source.reproject(
+                    res=2, resampling="nearest", transformer_options=options, mp_config=config, **controls
+                )
+            assert not source.is_loaded
+            assert not result.is_loaded
+            result_values = result.to_nanarray()
+            result_raster = result
+
+        # Check exact agreement with eager reprojection, and against the height offset we defined above
+        assert result_raster.transform == expected.transform
+        assert result_raster.crs == expected.crs
+        np.testing.assert_array_equal(result_values, expected.to_nanarray())
+        valid = np.isfinite(result_values)
+        assert np.any(valid)
+        expected_height = 110 if apply_vertical else 100
+        np.testing.assert_array_equal(result_values[valid], np.full(np.count_nonzero(valid), expected_height))
+        assert not source.is_loaded
 
     @pytest.mark.parametrize("path_index", [0, 2])
     @pytest.mark.parametrize("tile_size", [20])
@@ -2303,6 +2401,52 @@ class TestReprojectionErrors:
         # If wrong type for `ref`
         with pytest.raises(InvalidGridError, match="Cannot interpret reference grid from"):
             _ = r.reproject(ref=3)
+
+    @pytest.mark.parametrize("tolerance", [-1, np.nan, np.inf, -np.inf])
+    @pytest.mark.parametrize("raster_type", ["raster", "dataarray"])
+    def test_reproject__error_tolerance(self, tolerance: float, raster_type: str) -> None:
+        """Checks an error is raised for negative or non-finite tolerance before loading pixels."""
+
+        # Open an unloaded Raster or DataArray with valid georeferencing
+        source = gu.Raster(examples.get_path_test("everest_landsat_b4"))
+        image = source if raster_type == "raster" else gu.open_raster(source.name).rst
+        assert not image.is_loaded
+
+        # Request an invalid error tolerance
+        with pytest.raises(ValueError, match="tolerance must be a finite, non-negative number"):
+            image.reproject(crs=4326, tolerance=tolerance)
+
+        # Validation should leave the source pixels unloaded
+        assert not image.is_loaded
+
+    def test_reproject__error_tolerance_rasterio_version(self) -> None:
+        """Checks an error is raised for positive tolerance with Rasterio versions earlier than 1.5."""
+
+        # Open an unloaded raster and simulate a Rasterio version without the tolerance argument
+        source = gu.Raster(examples.get_path_test("everest_landsat_b4"))
+        assert not source.is_loaded
+
+        # Request approximation that this version cannot configure
+        with patch("geoutils.raster.transformation.rio.__version__", "1.4.4"):
+            with pytest.raises(NotImplementedError, match="Setting tolerance requires Rasterio >= 1.5"):
+                source.reproject(crs=4326, tolerance=0.125)
+
+        # Validation should leave the source pixels unloaded
+        assert not source.is_loaded
+
+    @pytest.mark.parametrize("operator", [Nearest(), Mean()])
+    @pytest.mark.parametrize("controls", [{"tolerance": 0.125}, {"apply_vertical": True}])
+    def test_reproject__error_warp_controls_operator(
+        self, operator: Interpolator | Reducer, controls: dict[str, Any]
+    ) -> None:
+        """Checks an error is raised for Rasterio warp controls with a GeoUtils Interpolator or Reducer."""
+
+        # Create a small raster for a custom resampling operation
+        source = gu.Raster.from_array(np.ones((4, 4)), rio.transform.from_origin(0, 4, 1, 1), 32631)
+
+        # These warp controls apply to Rasterio's calculation rather than custom resampling
+        with pytest.raises(ValueError, match="require a Rasterio resampling method"):
+            source.reproject(res=2, resampling=operator, **controls)
 
     def test_reproject__error_missing_crs(self) -> None:
         """Checks that we raise an error during reprojection if source raster has no CRS."""

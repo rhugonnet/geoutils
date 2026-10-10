@@ -1642,6 +1642,8 @@ class RasterBase(ABC):
         nodata: int | float | None = None,
         dtype: DTypeLike | None = None,
         resampling: Resampling | str | Interpolator | Reducer = None,
+        tolerance: float = 0,
+        apply_vertical: bool = False,
         transformer_options: dict[str, Any] | None = None,
         force_source_nodata: int | float | None = None,
         silent: bool = False,
@@ -1693,9 +1695,18 @@ class RasterBase(ABC):
             Can be configured with the global setting geoutils.config["reprojection_method"].
             See https://rasterio.readthedocs.io/en/stable/api/rasterio.enums.html#rasterio.enums.Resampling
             for the full list.
+        :param tolerance: Maximum error in source pixels when approximating a Rasterio warp transformation.
+            Defaults to 0 for an exact transformation and consistent results across chunks. Positive values
+            allow faster approximation but can produce different results across chunks. Requires Rasterio >= 1.5.
+        :param apply_vertical: Whether to apply the coordinate transformation's vertical shift to raster values
+            with Rasterio resampling. Use True for elevation values that need a vertical datum transformation.
+            Applies even when the horizontal grid is unchanged.
+            Defaults to False, so image values are only resampled. This does not control the ground height
+            used to locate RPC pixels; use ``RPC_HEIGHT`` or ``RPC_DEM`` in transformer_options for that.
         :param transformer_options: GDAL transformer options, such as ``RPC_DEM`` or ``RPC_HEIGHT``, passed to
             grid calculation and reprojection. When both GCPs and RPCs are stored, select one with
             ``{"SRC_METHOD": "RPC"}``, ``{"SRC_METHOD": "GCP_POLYNOMIAL"}`` or ``{"SRC_METHOD": "GCP_TPS"}``.
+            Explicit reproject() arguments take precedence over options with the same name.
         :param force_source_nodata: Force a source nodata value (read from the metadata by default).
         :param inplace: (DEPRECATED. Use rast = rast.reproject() instead) Whether to reproject in-place or not.
         :param silent: Whether to print warning statements.
@@ -1741,6 +1752,8 @@ class RasterBase(ABC):
             nodata=nodata,
             dtype=dtype,
             resampling=resampling,
+            tolerance=tolerance,
+            apply_vertical=apply_vertical,
             transformer_options=transformer_options,
             force_source_nodata=force_source_nodata,
             silent=silent,

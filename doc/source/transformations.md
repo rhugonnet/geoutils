@@ -42,32 +42,14 @@ loss of information (value interpolation, propagation of nodata).
 For rasters, it can be useful to use {func}`~geoutils.Raster.reproject` in the same CRS simply for re-gridding,
 for instance when downsampling to a new resolution {attr}`~geoutils.Raster.res`.
 
-Rasters referenced by **ground control points (GCPs)** or **rational polynomial coefficients (RPCs)** can also be
-reprojected through Rasterio/GDAL. GeoUtils reads these models automatically and uses them instead of the affine
-transform. The result has a regular affine grid. GCPs use their stored CRS; RPCs describe WGS84 coordinates.
-Use a Rasterio resampling name or enum, such as `"bilinear"`, and pass GDAL transformer options when needed:
-
-```python
-source = gu.Raster("satellite_image.tif")
-result = source.reproject(
-    crs=32632, resampling="bilinear", transformer_options={"RPC_DEM": "elevation.tif"}
-)
-```
-
-GCP/RPC reprojection supports **lazy Dask arrays** opened with `gu.open_raster(..., chunks=...)` and
-**multiprocessing** through `mp_config`. Both use the existing chunked reprojection workflow. Copies, arithmetic,
-band selection, pixel crops and file conversions preserve the models; pixel crops adjust their image offsets.
-Reproject to an affine grid before opening with `downsample` or using GeoUtils Interpolator/Reducer objects.
-Chunked GCP reprojection uses GDAL's default polynomial order or `SRC_METHOD="GCP_TPS"`; an explicit
-`MAX_GCP_ORDER` currently requires eager execution. For transformer options, see
-[Rasterio's GCP/RPC reprojection documentation](https://rasterio.readthedocs.io/en/stable/topics/reproject.html#reprojecting-with-other-georeferencing-metadata).
-
 ```{tip}
 Due to the loss of information when re-gridding, it is important to **minimize the number of reprojections during the
 analysis of rasters** (performing only one, if possible). For the same reason, when comparing vectors and rasters in
 different CRSs, it is usually **better to reproject the vector with no loss of information, which is the default
 behaviour of GeoUtils in raster–vector–point interfacing**.
 ```
+
+### Basic reprojection
 
 ```{code-cell} ipython3
 :tags: [hide-cell]
@@ -113,9 +95,15 @@ plt.tight_layout()
 
 ```{note}
 In GeoUtils, `"bilinear"` is the default resampling method. A simple {class}`str` matching the naming of a {class}`rasterio.enums.Resampling` method can be
-passed.
+passed. Resampling methods are listed in **[the dedicated section of Rasterio's API](https://rasterio.readthedocs.io/en/latest/api/rasterio.enums.html#rasterio.enums.Resampling)**.
 
-Resampling methods are listed in **[the dedicated section of Rasterio's API](https://rasterio.readthedocs.io/en/latest/api/rasterio.enums.html#rasterio.enums.Resampling)**.
+GeoUtils resampling uses `tolerance=0` by default to calculate exact pixel transformations and make results
+consistent across chunks. Rasterio/GDAL's default is 0.125 pixel, which allows faster computation but can
+change results depending on chunk bounds. Passing the `tolerance` option requires Rasterio 1.5 or newer.
+
+When values represent elevations and the transformation should also change their vertical datum,
+either use `apply_vertical=True` or use [xDEM](https://xdem.readthedocs.io/en/stable/)'s reprojection which accounts
+for vertical referencing implicitly.
 ```
 
 We can also simply pass another raster as reference to reproject to match the same CRS, and re-grid to the same bounds
@@ -152,6 +140,51 @@ vect_reproj.plot(ax=ax[2], ec="k", fc="none")
 _ = ax[1].set_yticklabels([])
 _ = ax[2].set_yticklabels([])
 plt.tight_layout()
+```
+
+### GCP/RPC reprojection
+
+Rasters referenced by **ground control points (GCPs)** or **rational polynomial coefficients (RPCs)** can also be
+reprojected, with chunked execution support through Dask/multiprocessing.
+GeoUtils reads and uses these models from file automatically. The result has a regular affine grid. GCPs use their stored CRS, and RPCs describe WGS84 coordinates.
+GCP/RPC reprojection requires a Rasterio resampling method, such as `"bilinear"`, which interpolates pixel values
+onto the output grid, while GDAL transformer options control how GCPs/RPCs map pixel positions to ground coordinates
+(see [Rasterio's documentation](https://rasterio.readthedocs.io/en/stable/topics/reproject.html#reprojecting-with-other-georeferencing-metadata)).
+
+We give the ASTER DEM GCPs at its four corners. The `GCP_TPS` option uses thin plate splines to map pixels smoothly through the 
+control points.
+
+```{code-cell} ipython3
+:tags: [hide-input]
+:mystnb:
+:  code_prompt_show: "Show the code for setting the GCPs"
+:  code_prompt_hide: "Hide the code for setting the GCPs"
+
+import rasterio as rio
+
+# Open the ASTER DEM and use its corner coordinates as GCPs
+source = gu.Raster(gu.examples.get_path("exploradores_aster_dem"))
+
+# Set their height to zero
+gcps = []
+for row in (0, source.height):
+    for col in (0, source.width):
+        x, y = source.transform * (col, row)
+        gcps.append(rio.control.GroundControlPoint(row=row, col=col, x=x, y=y, z=0))
+
+# Assign the GCPs and their CRS to the DEM
+source.gcps = (gcps, source.crs)
+```
+
+```{code-cell} ipython3
+# Reproject using the assigned GCPs and thin plate splines
+result = source.reproject(
+    crs=4326, resampling="bilinear", transformer_options={"SRC_METHOD": "GCP_TPS"}
+)
+
+# Show the regular affine grid created by reprojection
+print(result.crs)
+print(result.transform)
 ```
 
 ## Crop and clip
